@@ -198,6 +198,17 @@ class Attention(torch.nn.Module):
     #  out = torch.tanh(self.fc(decoder_hidden+encoder_outputs))
     #  return out.bmm(self.weight.unsqueeze(-1)).squeeze(-1)
 
+
+class selfAttention(torch.nn.Module):
+
+    def _init__(self, ):
+        super(selfAttention, self).__init__()
+        pass
+
+    def forward(self, encoder_outputs, decoder_hidden):
+        pass
+
+
 class VRAE(BaseEstimator, nn.Module):
     """Variational recurrent auto-encoder. This module is used for dimensionality reduction of timeseries
 
@@ -387,7 +398,7 @@ class VRAE(BaseEstimator, nn.Module):
         :return:
         """
 
-        vis = visdom.Visdom(env=env)
+        vis = visdom.Visdom(env=env, port=8097)
         train_loader = DataLoader(dataset = train_dataset,
                                   batch_size = self.batch_size,
                                   shuffle = True,
@@ -408,7 +419,7 @@ class VRAE(BaseEstimator, nn.Module):
                     X=z_run_pca, 
                     Y=val_label + 1, 
                     win_name="scatter"
-                        )
+                    )
 
         self.is_fitted = True
         if save:
