@@ -5,7 +5,10 @@ from torch import distributions
 from .base import BaseEstimator
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
+from .utils import *
 import os
+from sklearn.manifold import TSNE
+from sklearn.decomposition import TruncatedSVD
 
 
 class Encoder(nn.Module):
@@ -19,7 +22,7 @@ class Encoder(nn.Module):
     :param dropout: percentage of nodes to dropout
     :param block: LSTM/GRU block
     """
-    def __init__(self, number_of_features, hidden_size, hidden_layer_depth, latent_length, dropout, block = 'LSTM'):
+    def __init__(self, batch_size, number_of_features, hidden_size, hidden_layer_depth, latent_length, dropout, block = 'LSTM'):
 
         super(Encoder, self).__init__()
 
@@ -27,11 +30,12 @@ class Encoder(nn.Module):
         self.hidden_size = hidden_size
         self.hidden_layer_depth = hidden_layer_depth
         self.latent_length = latent_length
+        self.batch_size = batch_size
 
         if block == 'LSTM':
-            self.model = nn.LSTM(self.number_of_features, self.hidden_size, self.hidden_layer_depth, dropout = dropout)
+            self.model = nn.LSTM(self.number_of_features, self.hidden_size, self.hidden_layer_depth, dropout = dropout, bidirectional=True)
         elif block == 'GRU':
-            self.model = nn.GRU(self.number_of_features, self.hidden_size, self.hidden_layer_depth, dropout = dropout)
+            self.model = nn.GRU(self.number_of_features, self.hidden_size, self.hidden_layer_depth, dropout = dropout, bidirectional=True)
         else:
             raise NotImplementedError
 
@@ -42,10 +46,9 @@ class Encoder(nn.Module):
         :return: last hidden state of encoder, of shape (batch_size, hidden_size)
         """
 
-        _, (h_end, c_end) = self.model(x)
-
-        h_end = h_end[-1, :, :]
-        return h_end
+        enc_out, (h_end, c_end) = self.model(x)
+        #print("encoderデータサイズ",enc_out.size())
+        return torch.sum(h_end, dim=0), enc_out
 
 
 class Lambda(nn.Module):
@@ -106,24 +109,25 @@ class Decoder(nn.Module):
         self.latent_length = latent_length
         self.output_size = output_size
         self.dtype = dtype
+        self.attention = Attention(100)
 
         if block == 'LSTM':
-            self.model = nn.LSTM(1, self.hidden_size, self.hidden_layer_depth)
+            self.model = nn.LSTM(1, self.hidden_size, self.hidden_layer_depth, bidirectional=True)
         elif block == 'GRU':
-            self.model = nn.GRU(1, self.hidden_size, self.hidden_layer_depth)
+            self.model = nn.GRU(1, self.hidden_size, self.hidden_layer_depth, bidirectional=True)
         else:
             raise NotImplementedError
 
-        self.latent_to_hidden = nn.Linear(self.latent_length, self.hidden_size)
-        self.hidden_to_output = nn.Linear(self.hidden_size, self.output_size)
+        self.latent_to_hidden = nn.Linear(self.latent_length,  self.hidden_size)
+        self.hidden_to_output = nn.Linear(2 * self.hidden_size, self.output_size)
 
         self.decoder_inputs = torch.zeros(self.sequence_length, self.batch_size, 1, requires_grad=True).type(self.dtype)
-        self.c_0 = torch.zeros(self.hidden_layer_depth, self.batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
+        self.c_0 = torch.zeros(2 * self.hidden_layer_depth, self.batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
 
         nn.init.xavier_uniform_(self.latent_to_hidden.weight)
         nn.init.xavier_uniform_(self.hidden_to_output.weight)
 
-    def forward(self, latent):
+    def forward(self, latent, encoder_output, need_attention=True):
         """Converts latent to hidden to output
 
         :param latent: latent vector
@@ -132,7 +136,7 @@ class Decoder(nn.Module):
         h_state = self.latent_to_hidden(latent)
 
         if isinstance(self.model, nn.LSTM):
-            h_0 = torch.stack([h_state for _ in range(self.hidden_layer_depth)])
+            h_0 = torch.stack([h_state for _ in range(2*self.hidden_layer_depth)])
             decoder_output, _ = self.model(self.decoder_inputs, (h_0, self.c_0))
         elif isinstance(self.model, nn.GRU):
             h_0 = torch.stack([h_state for _ in range(self.hidden_layer_depth)])
@@ -140,6 +144,10 @@ class Decoder(nn.Module):
         else:
             raise NotImplementedError
 
+        if need_attention:
+            context_vec = self.attention(encoder_output.permute(1, 0, 2), \
+                                    decoder_output.permute(1, 2, 0))
+            out = context_vec.permute(1, 0, 2) + decoder_output
         out = self.hidden_to_output(decoder_output)
         return out
 
@@ -147,6 +155,48 @@ def _assert_no_grad(tensor):
     assert not tensor.requires_grad, \
         "nn criterions don't compute the gradient w.r.t. targets - please " \
         "mark these tensors as not requiring gradients"
+
+class Attention(torch.nn.Module):
+  def __init__(self, hidden_size, method="dot"):
+    super(Attention, self).__init__()
+    self.method = method
+    self.hidden_size = hidden_size
+    
+    #https://blog.floydhub.com/attention-mechanism/
+    # Defining the layers/weights required depending on alignment scoring method
+    if method == "general":
+      self.fc = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+      
+    elif method == "concat":
+      self.fc = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+      self.weight = torch.nn.Parameter(torch.FloatTensor(1, hidden_size))
+  
+  def forward(self, encoder_outputs, decoder_hidden):
+    #encoder_outputs [batch_size, seq_len, hidden_dim]
+    #decoder_hidden [batch_size, hidden_dim, seq_len]
+    #return context [batch_size, seq_len, hidden_dim]
+
+    if self.method == "dot":
+      # For the dot scoring method, no weights or linear layers are involved
+      sim_matrix = encoder_outputs.bmm(decoder_hidden)
+      sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=2)
+      
+      def context_fun(encoder_outputs, sim_matrix, index):
+          context_vec = encoder_outputs * sim_matrix[:, :, index].unsqueeze(2)
+          return context_vec.sum(dim=1).unsqueeze(1)
+      
+      return torch.cat([context_fun(encoder_outputs, sim_matrix, i) \
+                    for i in range(sim_matrix.size(2))], dim=1)
+
+    #elif self.method == "general":
+      # For general scoring, decoder hidden state is passed through linear layers to introduce a weight matrix
+    #  out = self.fc(decoder_hidden)
+    #  return encoder_outputs.bmm(out.view(1,-1,1)).squeeze(-1)
+    
+    #elif self.method == "concat":
+      # For concat scoring, decoder hidden state and encoder outputs are concatenated first
+    #  out = torch.tanh(self.fc(decoder_hidden+encoder_outputs))
+    #  return out.bmm(self.weight.unsqueeze(-1)).squeeze(-1)
 
 class VRAE(BaseEstimator, nn.Module):
     """Variational recurrent auto-encoder. This module is used for dimensionality reduction of timeseries
@@ -179,6 +229,7 @@ class VRAE(BaseEstimator, nn.Module):
 
         self.dtype = torch.FloatTensor
         self.use_cuda = cuda
+        self.total_epoch = 0
 
         if not torch.cuda.is_available() and self.use_cuda:
             self.use_cuda = False
@@ -188,7 +239,8 @@ class VRAE(BaseEstimator, nn.Module):
             self.dtype = torch.cuda.FloatTensor
 
 
-        self.encoder = Encoder(number_of_features = number_of_features,
+        self.encoder = Encoder(batch_size=batch_size,
+                               number_of_features = number_of_features,
                                hidden_size=hidden_size,
                                hidden_layer_depth=hidden_layer_depth,
                                latent_length=latent_length,
@@ -206,7 +258,7 @@ class VRAE(BaseEstimator, nn.Module):
                                output_size=number_of_features,
                                block=block,
                                dtype=self.dtype)
-
+        
         self.sequence_length = sequence_length
         self.hidden_size = hidden_size
         self.hidden_layer_depth = hidden_layer_depth
@@ -249,10 +301,9 @@ class VRAE(BaseEstimator, nn.Module):
         :param x:input tensor
         :return: the decoded output, latent vector
         """
-        cell_output = self.encoder(x)
+        cell_output, enc_output = self.encoder(x)
         latent = self.lmbd(cell_output)
-        x_decoded = self.decoder(latent)
-
+        x_decoded = self.decoder(latent, enc_output)
         return x_decoded, latent
 
     def _rec(self, x_decoded, x, loss_fn):
@@ -287,7 +338,7 @@ class VRAE(BaseEstimator, nn.Module):
         return loss, recon_loss, kl_loss, x
 
 
-    def _train(self, train_loader):
+    def _train(self, train_loader, vis):
         """
         For each epoch, given the batch_size, run this function batch_size * num_of_batches number of times
 
@@ -310,15 +361,16 @@ class VRAE(BaseEstimator, nn.Module):
             self.optimizer.zero_grad()
             loss, recon_loss, kl_loss, _ = self.compute_loss(X)
             loss.backward()
-
             if self.clip:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm = self.max_grad_norm)
-
+            
+            self.total_epoch += 1
             # accumulator
             epoch_loss += loss.item()
-
             self.optimizer.step()
 
+            #visulization_train_process
+            visulization(vis, "line", X=self.total_epoch, Y=loss.item(), win_name="all")           
             if (t + 1) % self.print_every == 0:
                 print('Batch %d, loss = %.4f, recon_loss = %.4f, kl_loss = %.4f' % (t + 1, loss.item(),
                                                                                     recon_loss.item(), kl_loss.item()))
@@ -326,7 +378,7 @@ class VRAE(BaseEstimator, nn.Module):
         print('Average loss: {:.4f}'.format(epoch_loss / t))
 
 
-    def fit(self, dataset, save = False):
+    def fit(self, train_dataset, val_dataset, val_label, env = "vrae", save = False):
         """
         Calls `_train` function over a fixed number of epochs, specified by `n_epochs`
 
@@ -335,7 +387,8 @@ class VRAE(BaseEstimator, nn.Module):
         :return:
         """
 
-        train_loader = DataLoader(dataset = dataset,
+        vis = visdom.Visdom(env=env)
+        train_loader = DataLoader(dataset = train_dataset,
                                   batch_size = self.batch_size,
                                   shuffle = True,
                                   drop_last=True)
@@ -343,7 +396,19 @@ class VRAE(BaseEstimator, nn.Module):
         for i in range(self.n_epochs):
             print('Epoch: %s' % i)
 
-            self._train(train_loader)
+            self._train(train_loader, vis)
+            with torch.no_grad():
+                z_run = self.transform(val_dataset, for_visual=True)
+                z_run_pca = TruncatedSVD(n_components=3).fit_transform(z_run)
+            
+            print(z_run_pca)
+            visulization(
+                    vis, 
+                    "scatter", 
+                    X=z_run_pca, 
+                    Y=val_label + 1, 
+                    win_name="scatter"
+                        )
 
         self.is_fitted = True
         if save:
@@ -360,7 +425,7 @@ class VRAE(BaseEstimator, nn.Module):
         return self.lmbd(
                     self.encoder(
                         Variable(x.type(self.dtype), requires_grad = False)
-                    )
+                    )[0]
         ).cpu().data.numpy()
 
     def _batch_reconstruct(self, x):
@@ -417,7 +482,7 @@ class VRAE(BaseEstimator, nn.Module):
         raise RuntimeError('Model needs to be fit')
 
 
-    def transform(self, dataset, save = False):
+    def transform(self, dataset, for_visual=False, save = False):
         """
         Given input dataset, creates dataloader, runs dataloader on `_batch_transform`
         Prerequisite is that model has to be fit
@@ -432,7 +497,7 @@ class VRAE(BaseEstimator, nn.Module):
                                  batch_size = self.batch_size,
                                  shuffle = False,
                                  drop_last=True) # Don't shuffle for test_loader
-        if self.is_fitted:
+        if (self.is_fitted) or (for_visual):
             with torch.no_grad():
                 z_run = []
 

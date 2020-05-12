@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 from plotly.graph_objs import *
 import plotly
-
+import visdom
 
 def plot_clustering(z_run, labels, engine ='plotly', download = False, folder_name ='clustering'):
     """
@@ -74,6 +74,7 @@ def plot_clustering(z_run, labels, engine ='plotly', download = False, folder_na
         z_run_tsne = TSNE(perplexity=80, min_grad_norm=1E-12, n_iter=3000).fit_transform(z_run)
 
         plt.scatter(z_run_pca[:, 0], z_run_pca[:, 1], c=colors, marker='*', linewidths=0)
+        plt.legend()
         plt.title('PCA on z_run')
         if download:
             if os.path.exists(folder_name):
@@ -85,6 +86,7 @@ def plot_clustering(z_run, labels, engine ='plotly', download = False, folder_na
             plt.show()
 
         plt.scatter(z_run_tsne[:, 0], z_run_tsne[:, 1], c=colors, marker='*', linewidths=0)
+        plt.legend()
         plt.title('tSNE on z_run')
         if download:
             if os.path.exists(folder_name):
@@ -120,3 +122,42 @@ def open_data(direc, ratio_train=0.8, dataset="ECG5000"):
     ind = np.random.permutation(N)
     return data[ind[:ind_cut], 1:, :], data[ind[ind_cut:], 1:, :], data[ind[:ind_cut], 0, :], data[ind[ind_cut:], 0, :]
 
+
+def visulization(vis, ptype, X, Y, win_name):
+    """
+    vis:visdom instance
+    ptype:plot type, "line", "scattor"
+    X:X aixs label
+    Y:Y aixs label
+    win_name: name of pane
+    """
+    if ptype == "line":
+        vis.line(
+            X=np.array([X]), 
+            Y=np.array([Y]), 
+            win='loss_' + win_name, 
+            update="append",
+            opts={
+                'title':'loss' + win_name,
+                'xlabel':'epoch',
+                'ylabel':'loss', 
+                } 
+            )
+        
+    elif ptype == "scatter":
+        vis.scatter(
+            X=X,
+            Y=Y[:X.shape[0], :] + 1,
+            win="win",
+            update="replace",
+            opts=dict(
+                title="z_run_py_pca",
+                #legend=["class_{}".format(str(int(i))) for i in np.unique(Y)],
+                markersize=5,
+                )
+            )
+
+
+
+    
+    
