@@ -201,14 +201,30 @@ class Attention(torch.nn.Module):
 
 class selfAttention(torch.nn.Module):
 
-    def _init__(self, ):
-        super(selfAttention, self).__init__()
-        pass
+  def __init__(self, hidden_size, method="dot"):
+    super(selfAttention, self).__init__()
+    self.method = method
+    self.hidden_size = hidden_size
+    
+    #https://blog.floydhub.com/attention-mechanism/
+    # Defining the layers/weights required depending on alignment scoring method
+  def forward(self, encoder_outputs):
+    #encoder_outputs [batch_size, seq_len, hidden_dim]
+    #decoder_hidden [batch_size, hidden_dim, seq_len]
+    #return context [batch_size, seq_len, hidden_dim]
 
-    def forward(self, encoder_outputs, decoder_hidden):
-        pass
-
-
+    if self.method == "dot":
+      # For the dot scoring method, no weights or linear layers are involved
+      sim_matrix = encoder_outputs.permute(1, 0, 2).bmm(encoder_outputs.permute(1, 2, 0))
+      sim_matrix = sim_matrix / np.sqrt(self.hidden_size)
+      sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=2)
+      
+      def context_fun(encoder_outputs, sim_matrix, index):
+          context_vec = encoder_outputs.permute(1, 0, 2) * sim_matrix[:, index, :].unsqueeze(2)
+          return context_vec.sum(dim=1).unsqueeze(1)
+      
+      return torch.cat([context_fun(encoder_outputs, sim_matrix, i) \
+                    for i in range(sim_matrix.size(2))], dim=1)
 class VRAE(BaseEstimator, nn.Module):
     """Variational recurrent auto-encoder. This module is used for dimensionality reduction of timeseries
 
