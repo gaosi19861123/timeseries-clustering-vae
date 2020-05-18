@@ -83,6 +83,7 @@ class Lambda(nn.Module):
             std = torch.exp(0.5 * self.latent_logvar)
             eps = torch.randn_like(std)
             return eps.mul(std).add_(self.latent_mean)
+        
         else:
             return self.latent_mean
 
@@ -98,7 +99,7 @@ class Decoder(nn.Module):
     :param block: GRU/LSTM - use the same which you've used in the encoder
     :param dtype: Depending on cuda enabled/disabled, create the tensor
     """
-    def __init__(self, sequence_length, batch_size, hidden_size, hidden_layer_depth, latent_length, output_size, dtype, block='LSTM'):
+    def __init__(self, sequence_length, batch_size, hidden_size, hidden_layer_depth, latent_length, output_size, dtype, block='LSTM', lam = Lambda):
 
         super(Decoder, self).__init__()
 
@@ -109,20 +110,23 @@ class Decoder(nn.Module):
         self.latent_length = latent_length
         self.output_size = output_size
         self.dtype = dtype
-        self.attention = Attention(100)
+        self.attention = selfAttention() #Attention(100)
+        self.lam = lam(2 * hidden_size, latent_length)
 
         if block == 'LSTM':
-            self.model = nn.LSTM(1, self.hidden_size, self.hidden_layer_depth, bidirectional=True)
+            self.model = nn.LSTM(latent_length * 2, self.hidden_size, self.hidden_layer_depth, bidirectional=True)
         elif block == 'GRU':
-            self.model = nn.GRU(1, self.hidden_size, self.hidden_layer_depth, bidirectional=True)
+            self.model = nn.GRU(latent_length * 2, self.hidden_size, self.hidden_layer_depth, bidirectional=True)
         else:
             raise NotImplementedError
 
         self.latent_to_hidden = nn.Linear(self.latent_length,  self.hidden_size)
         self.hidden_to_output = nn.Linear(2 * self.hidden_size, self.output_size)
 
-        self.decoder_inputs = torch.zeros(self.sequence_length, self.batch_size, 1, requires_grad=True).type(self.dtype)
+        #[sequence_length, batch_size, feature_size] 
+        #self.decoder_inputs = torch.zeros(self.sequence_length, self.batch_size, 1, requires_grad=True).type(self.dtype)
         self.c_0 = torch.zeros(2 * self.hidden_layer_depth, self.batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
+        self.h_0 = torch.zeros(2 * self.hidden_layer_depth, self.batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
 
         nn.init.xavier_uniform_(self.latent_to_hidden.weight)
         nn.init.xavier_uniform_(self.hidden_to_output.weight)
@@ -133,21 +137,32 @@ class Decoder(nn.Module):
         :param latent: latent vector
         :return: outputs consisting of mean and std dev of vector
         """
-        h_state = self.latent_to_hidden(latent)
+        #print(latent.size())
+        #h_state = self.latent_to_hidden(latent)
+        #h_state.unsqueeze_(dim=1)
+        latent_repeated = torch.repeat_interleave(latent.unsqueeze_(dim=1), self.sequence_length, dim=1)
+        #print("latent_repeat:", latent_repeated.size())
+
+        if need_attention:
+            #context_vec = self.attention(encoder_output.permute(1, 0, 2), \
+            #                        decoder_output.permute(1, 2, 0))
+            #out = context_vec.permute(1, 0, 2) + decoder_output
+            #print("コンテキストサイズ", context_vec.size())
+            context_vec = self.attention(encoder_output)
+            decoder_Input = self.lam(context_vec)
+            #print("decoder_size:", decoder_Input.size())
+            
+            decoder_conbinded = torch.cat((decoder_Input, latent_repeated), dim=2) 
 
         if isinstance(self.model, nn.LSTM):
-            h_0 = torch.stack([h_state for _ in range(2*self.hidden_layer_depth)])
-            decoder_output, _ = self.model(self.decoder_inputs, (h_0, self.c_0))
+            #h_0 = torch.stack([h_state for _ in range(2*self.hidden_layer_depth)])
+            decoder_output, _ = self.model(decoder_conbinded.permute(1, 0, 2), (self.h_0, self.c_0))
         elif isinstance(self.model, nn.GRU):
-            h_0 = torch.stack([h_state for _ in range(self.hidden_layer_depth)])
-            decoder_output, _ = self.model(self.decoder_inputs, h_0)
+            #h_0 = torch.stack([h_state for _ in range(self.hidden_layer_depth)])
+            decoder_output, _ = self.model(decoder_conbinded.permute(1, 0, 2), self.h_0)
         else:
             raise NotImplementedError
 
-        if need_attention:
-            context_vec = self.attention(encoder_output.permute(1, 0, 2), \
-                                    decoder_output.permute(1, 2, 0))
-            out = context_vec.permute(1, 0, 2) + decoder_output
         out = self.hidden_to_output(decoder_output)
         return out
 
@@ -201,13 +216,11 @@ class Attention(torch.nn.Module):
 
 class selfAttention(torch.nn.Module):
 
-  def __init__(self, hidden_size, method="dot"):
+  def __init__(self, method="dot"):
     super(selfAttention, self).__init__()
     self.method = method
-    self.hidden_size = hidden_size
-    
-    #https://blog.floydhub.com/attention-mechanism/
-    # Defining the layers/weights required depending on alignment scoring method
+    #self.hidden_size = hidden_size
+
   def forward(self, encoder_outputs):
     #encoder_outputs [batch_size, seq_len, hidden_dim]
     #decoder_hidden [batch_size, hidden_dim, seq_len]
@@ -215,8 +228,9 @@ class selfAttention(torch.nn.Module):
 
     if self.method == "dot":
       # For the dot scoring method, no weights or linear layers are involved
+      scale_size = encoder_outputs.size(2)
       sim_matrix = encoder_outputs.permute(1, 0, 2).bmm(encoder_outputs.permute(1, 2, 0))
-      sim_matrix = sim_matrix / np.sqrt(self.hidden_size)
+      sim_matrix = sim_matrix / np.sqrt(scale_size)
       sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=2)
       
       def context_fun(encoder_outputs, sim_matrix, index):
@@ -225,6 +239,7 @@ class selfAttention(torch.nn.Module):
       
       return torch.cat([context_fun(encoder_outputs, sim_matrix, i) \
                     for i in range(sim_matrix.size(2))], dim=1)
+
 class VRAE(BaseEstimator, nn.Module):
     """Variational recurrent auto-encoder. This module is used for dimensionality reduction of timeseries
 
