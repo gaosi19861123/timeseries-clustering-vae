@@ -87,6 +87,32 @@ class Lambda(nn.Module):
         else:
             return self.latent_mean
 
+class selfAttention(torch.nn.Module):
+
+  def __init__(self, method="dot"):
+    super(selfAttention, self).__init__()
+    self.method = method
+    #self.hidden_size = hidden_size
+
+  def forward(self, encoder_outputs):
+    #encoder_outputs [batch_size, seq_len, hidden_dim]
+    #decoder_hidden [batch_size, hidden_dim, seq_len]
+    #return context [batch_size, seq_len, hidden_dim]
+
+    if self.method == "dot":
+      # For the dot scoring method, no weights or linear layers are involved
+      scale_size = encoder_outputs.size(2)
+      sim_matrix = encoder_outputs.permute(1, 0, 2).bmm(encoder_outputs.permute(1, 2, 0))
+      sim_matrix = sim_matrix / np.sqrt(scale_size)
+      sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=2)
+      
+      def context_fun(encoder_outputs, sim_matrix, index):
+          context_vec = encoder_outputs.permute(1, 0, 2) * sim_matrix[:, index, :].unsqueeze(2)
+          return context_vec.sum(dim=1).unsqueeze(1)
+      
+      return torch.cat([context_fun(encoder_outputs, sim_matrix, i) \
+                    for i in range(sim_matrix.size(2))], dim=1)
+
 class Decoder(nn.Module):
     """Converts latent vector into output
 
@@ -147,7 +173,6 @@ class Decoder(nn.Module):
             #context_vec = self.attention(encoder_output.permute(1, 0, 2), \
             #                        decoder_output.permute(1, 2, 0))
             #out = context_vec.permute(1, 0, 2) + decoder_output
-            #print("コンテキストサイズ", context_vec.size())
             context_vec = self.attention(encoder_output)
             decoder_Input = self.lam(context_vec)
             #print("decoder_size:", decoder_Input.size())
@@ -163,82 +188,25 @@ class Decoder(nn.Module):
         else:
             raise NotImplementedError
 
+        #print("decoder_output:", decoder_output.size())
+
         out = self.hidden_to_output(decoder_output)
-        return out
+        print("output.size:", out.size())
+        return out, self.lam.latent_mean, self.lam.latent_logvar
 
 def _assert_no_grad(tensor):
     assert not tensor.requires_grad, \
         "nn criterions don't compute the gradient w.r.t. targets - please " \
         "mark these tensors as not requiring gradients"
 
-class Attention(torch.nn.Module):
-  def __init__(self, hidden_size, method="dot"):
-    super(Attention, self).__init__()
-    self.method = method
-    self.hidden_size = hidden_size
+class LaplicanLoss(torch.nn.Module):
+    def __init__(self, ):
+        super(LaplicanLoss, self).__init__()
     
-    #https://blog.floydhub.com/attention-mechanism/
-    # Defining the layers/weights required depending on alignment scoring method
-    if method == "general":
-      self.fc = torch.nn.Linear(hidden_size, hidden_size, bias=False)
-      
-    elif method == "concat":
-      self.fc = torch.nn.Linear(hidden_size, hidden_size, bias=False)
-      self.weight = torch.nn.Parameter(torch.FloatTensor(1, hidden_size))
-  
-  def forward(self, encoder_outputs, decoder_hidden):
-    #encoder_outputs [batch_size, seq_len, hidden_dim]
-    #decoder_hidden [batch_size, hidden_dim, seq_len]
-    #return context [batch_size, seq_len, hidden_dim]
-
-    if self.method == "dot":
-      # For the dot scoring method, no weights or linear layers are involved
-      sim_matrix = encoder_outputs.bmm(decoder_hidden)
-      sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=2)
-      
-      def context_fun(encoder_outputs, sim_matrix, index):
-          context_vec = encoder_outputs * sim_matrix[:, :, index].unsqueeze(2)
-          return context_vec.sum(dim=1).unsqueeze(1)
-      
-      return torch.cat([context_fun(encoder_outputs, sim_matrix, i) \
-                    for i in range(sim_matrix.size(2))], dim=1)
-
-    #elif self.method == "general":
-      # For general scoring, decoder hidden state is passed through linear layers to introduce a weight matrix
-    #  out = self.fc(decoder_hidden)
-    #  return encoder_outputs.bmm(out.view(1,-1,1)).squeeze(-1)
-    
-    #elif self.method == "concat":
-      # For concat scoring, decoder hidden state and encoder outputs are concatenated first
-    #  out = torch.tanh(self.fc(decoder_hidden+encoder_outputs))
-    #  return out.bmm(self.weight.unsqueeze(-1)).squeeze(-1)
-
-
-class selfAttention(torch.nn.Module):
-
-  def __init__(self, method="dot"):
-    super(selfAttention, self).__init__()
-    self.method = method
-    #self.hidden_size = hidden_size
-
-  def forward(self, encoder_outputs):
-    #encoder_outputs [batch_size, seq_len, hidden_dim]
-    #decoder_hidden [batch_size, hidden_dim, seq_len]
-    #return context [batch_size, seq_len, hidden_dim]
-
-    if self.method == "dot":
-      # For the dot scoring method, no weights or linear layers are involved
-      scale_size = encoder_outputs.size(2)
-      sim_matrix = encoder_outputs.permute(1, 0, 2).bmm(encoder_outputs.permute(1, 2, 0))
-      sim_matrix = sim_matrix / np.sqrt(scale_size)
-      sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=2)
-      
-      def context_fun(encoder_outputs, sim_matrix, index):
-          context_vec = encoder_outputs.permute(1, 0, 2) * sim_matrix[:, index, :].unsqueeze(2)
-          return context_vec.sum(dim=1).unsqueeze(1)
-      
-      return torch.cat([context_fun(encoder_outputs, sim_matrix, i) \
-                    for i in range(sim_matrix.size(2))], dim=1)
+    def forward(self, x, myu, scale):
+        prob = torch.exp(-torch.abs(x - myu) / scale)/(2. * scale)
+        log_prob = torch.log(prob)
+        return log_prob
 
 class VRAE(BaseEstimator, nn.Module):
     """Variational recurrent auto-encoder. This module is used for dimensionality reduction of timeseries
@@ -345,7 +313,8 @@ class VRAE(BaseEstimator, nn.Module):
         """
         cell_output, enc_output = self.encoder(x)
         latent = self.lmbd(cell_output)
-        x_decoded = self.decoder(latent, enc_output)
+        x_decoded, self.T_mean, self.T_var = self.decoder(latent, enc_output)
+        #print("T_mean_size:{0}, T_var_size:{1}".format(self.T_mean.size(), self.T_var.size()))
         return x_decoded, latent
 
     def _rec(self, x_decoded, x, loss_fn):
@@ -360,9 +329,10 @@ class VRAE(BaseEstimator, nn.Module):
         latent_mean, latent_logvar = self.lmbd.latent_mean, self.lmbd.latent_logvar
 
         kl_loss = -0.5 * torch.mean(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp())
+        TK1_loss = -0.5 * torch.mean(torch.sum(1 + self.T_var - self.T_mean.pow(2) - self.T_var.exp(), dim=1))
         recon_loss = loss_fn(x_decoded, x)
 
-        return kl_loss + recon_loss, recon_loss, kl_loss
+        return kl_loss + recon_loss + TK1_loss, recon_loss, kl_loss, TK1_loss
 
     def compute_loss(self, X):
         """
@@ -375,9 +345,9 @@ class VRAE(BaseEstimator, nn.Module):
         x = Variable(X[:,:,:].type(self.dtype), requires_grad = True)
 
         x_decoded, _ = self(x)
-        loss, recon_loss, kl_loss = self._rec(x_decoded, x.detach(), self.loss_fn)
+        loss, recon_loss, kl_loss, TK1_loss = self._rec(x_decoded, x.detach(), self.loss_fn)
 
-        return loss, recon_loss, kl_loss, x
+        return loss, recon_loss, kl_loss, TK1_loss, x
 
 
     def _train(self, train_loader, vis):
@@ -401,7 +371,7 @@ class VRAE(BaseEstimator, nn.Module):
             X = X.permute(1,0,2)
 
             self.optimizer.zero_grad()
-            loss, recon_loss, kl_loss, _ = self.compute_loss(X)
+            loss, recon_loss, kl_loss, TK1_loss, _ = self.compute_loss(X)
             loss.backward()
             if self.clip:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm = self.max_grad_norm)
@@ -414,8 +384,8 @@ class VRAE(BaseEstimator, nn.Module):
             #visulization_train_process
             visulization(vis, "line", X=self.total_epoch, Y=loss.item(), win_name="all")           
             if (t + 1) % self.print_every == 0:
-                print('Batch %d, loss = %.4f, recon_loss = %.4f, kl_loss = %.4f' % (t + 1, loss.item(),
-                                                                                    recon_loss.item(), kl_loss.item()))
+                print('Batch %d, loss = %.4f, recon_loss = %.4f, kl_loss = %.4f, TK1_loss = %.4f' % (t + 1, loss.item(),
+                                                                                    recon_loss.item(), kl_loss.item(), TK1_loss.item()))
 
         print('Average loss: {:.4f}'.format(epoch_loss / t))
 
