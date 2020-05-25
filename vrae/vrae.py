@@ -9,6 +9,7 @@ from .utils import *
 import os
 from sklearn.manifold import TSNE
 from sklearn.decomposition import TruncatedSVD
+from torch.nn import functional as F
 
 
 class Encoder(nn.Module):
@@ -147,7 +148,8 @@ class Decoder(nn.Module):
             raise NotImplementedError
 
         self.latent_to_hidden = nn.Linear(self.latent_length,  self.hidden_size)
-        self.hidden_to_output = nn.Linear(2 * self.hidden_size, self.output_size)
+        self.hidden_to_myu = nn.Linear(2 * self.hidden_size, self.output_size)
+        self.hidden_to_scale = nn.Linear(2 * self.hidden_size, self.output_size)
 
         #[sequence_length, batch_size, feature_size] 
         #self.decoder_inputs = torch.zeros(self.sequence_length, self.batch_size, 1, requires_grad=True).type(self.dtype)
@@ -155,7 +157,8 @@ class Decoder(nn.Module):
         self.h_0 = torch.zeros(2 * self.hidden_layer_depth, self.batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
 
         nn.init.xavier_uniform_(self.latent_to_hidden.weight)
-        nn.init.xavier_uniform_(self.hidden_to_output.weight)
+        nn.init.xavier_uniform_(self.hidden_to_myu.weight)
+        nn.init.xavier_uniform_(self.hidden_to_scale.weight)
 
     def forward(self, latent, encoder_output, need_attention=True):
         """Converts latent to hidden to output
@@ -190,9 +193,11 @@ class Decoder(nn.Module):
 
         #print("decoder_output:", decoder_output.size())
 
-        out = self.hidden_to_output(decoder_output)
-        print("output.size:", out.size())
-        return out, self.lam.latent_mean, self.lam.latent_logvar
+        myu = self.hidden_to_myu(decoder_output)
+        scale = self.hidden_to_scale(decoder_output)
+        scale = F.softplus(scale)
+        #print("output.size:", myu.size())
+        return myu, self.lam.latent_mean, self.lam.latent_logvar, scale
 
 def _assert_no_grad(tensor):
     assert not tensor.requires_grad, \
@@ -200,12 +205,19 @@ def _assert_no_grad(tensor):
         "mark these tensors as not requiring gradients"
 
 class LaplicanLoss(torch.nn.Module):
-    def __init__(self, ):
+    def __init__(self, size_average=True):
         super(LaplicanLoss, self).__init__()
+        self.size_average = size_average
     
     def forward(self, x, myu, scale):
-        prob = torch.exp(-torch.abs(x - myu) / scale)/(2. * scale)
-        log_prob = torch.log(prob)
+
+        prob = -torch.abs(x - myu) / scale + torch.log(1 / (2. * scale))
+        
+        if self.size_average: 
+            log_prob = torch.mean(torch.sum(prob, dim=0))
+        else: 
+            log_prob = torch.sum(torch.sum(prob, dim=0))
+
         return log_prob
 
 class VRAE(BaseEstimator, nn.Module):
@@ -232,7 +244,8 @@ class VRAE(BaseEstimator, nn.Module):
     def __init__(self, sequence_length, number_of_features, hidden_size=90, hidden_layer_depth=2, latent_length=20,
                  batch_size=32, learning_rate=0.005, block='LSTM',
                  n_epochs=5, dropout_rate=0., optimizer='Adam', loss='MSELoss',
-                 cuda=False, print_every=100, clip=True, max_grad_norm=5, dload='.'):
+                 cuda=False, print_every=100, clip=True, max_grad_norm=5, dload='.',
+                 k1=0.01, k2=0.01):
 
         super(VRAE, self).__init__()
 
@@ -282,6 +295,9 @@ class VRAE(BaseEstimator, nn.Module):
         self.max_grad_norm = max_grad_norm
         self.is_fitted = False
         self.dload = dload
+        self.loss_type = loss
+        self.k1 = k1
+        self.k2 = k2
 
         if self.use_cuda:
             self.cuda()
@@ -297,6 +313,8 @@ class VRAE(BaseEstimator, nn.Module):
             self.loss_fn = nn.SmoothL1Loss(size_average=False)
         elif loss == 'MSELoss':
             self.loss_fn = nn.MSELoss(size_average=False)
+        elif loss == 'LaplacianLoss':
+            self.loss_fn = LaplicanLoss(size_average=False) 
 
     def __repr__(self):
         return """VRAE(n_epochs={n_epochs},batch_size={batch_size},cuda={cuda})""".format(
@@ -313,11 +331,11 @@ class VRAE(BaseEstimator, nn.Module):
         """
         cell_output, enc_output = self.encoder(x)
         latent = self.lmbd(cell_output)
-        x_decoded, self.T_mean, self.T_var = self.decoder(latent, enc_output)
+        x_decoded, self.T_mean, self.T_var, scale = self.decoder(latent, enc_output)
         #print("T_mean_size:{0}, T_var_size:{1}".format(self.T_mean.size(), self.T_var.size()))
-        return x_decoded, latent
+        return x_decoded, latent, scale
 
-    def _rec(self, x_decoded, x, loss_fn):
+    def _rec(self, x_decoded, x, loss_fn, scale):
         """
         Compute the loss given output x decoded, input x and the specified loss function
 
@@ -327,12 +345,16 @@ class VRAE(BaseEstimator, nn.Module):
         :return: joint loss, reconstruction loss and kl-divergence loss
         """
         latent_mean, latent_logvar = self.lmbd.latent_mean, self.lmbd.latent_logvar
-
         kl_loss = -0.5 * torch.mean(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp())
         TK1_loss = -0.5 * torch.mean(torch.sum(1 + self.T_var - self.T_mean.pow(2) - self.T_var.exp(), dim=1))
-        recon_loss = loss_fn(x_decoded, x)
+        
+        if (self.loss_type == "MSELoss") or (self.loss_type == "SmoothL1Loss"):
+            recon_loss = loss_fn(x_decoded, x)
 
-        return kl_loss + recon_loss + TK1_loss, recon_loss, kl_loss, TK1_loss
+        elif self.loss_type == "LaplacianLoss":
+            recon_loss = -loss_fn(x, x_decoded, scale)
+
+        return recon_loss + kl_loss + self.k2 * TK1_loss, recon_loss, kl_loss, TK1_loss
 
     def compute_loss(self, X):
         """
@@ -344,8 +366,8 @@ class VRAE(BaseEstimator, nn.Module):
         """
         x = Variable(X[:,:,:].type(self.dtype), requires_grad = True)
 
-        x_decoded, _ = self(x)
-        loss, recon_loss, kl_loss, TK1_loss = self._rec(x_decoded, x.detach(), self.loss_fn)
+        x_decoded, _, scale = self(x)
+        loss, recon_loss, kl_loss, TK1_loss = self._rec(x_decoded, x.detach(), self.loss_fn, scale)
 
         return loss, recon_loss, kl_loss, TK1_loss, x
 
