@@ -435,7 +435,6 @@ class VRAE(BaseEstimator, nn.Module):
                 z_run = self.transform(val_dataset, for_visual=True)
                 z_run_pca = TruncatedSVD(n_components=3).fit_transform(z_run)
             
-            print(z_run_pca)
             visulization(
                     vis, 
                     "scatter", 
