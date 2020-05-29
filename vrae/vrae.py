@@ -245,7 +245,7 @@ class VRAE(BaseEstimator, nn.Module):
                  batch_size=32, learning_rate=0.005, block='LSTM',
                  n_epochs=5, dropout_rate=0., optimizer='Adam', loss='MSELoss',
                  cuda=False, print_every=100, clip=True, max_grad_norm=5, dload='.',
-                 k1=0.01, k2=0.01):
+                 k2=0.01):
 
         super(VRAE, self).__init__()
 
@@ -256,7 +256,6 @@ class VRAE(BaseEstimator, nn.Module):
 
         if not torch.cuda.is_available() and self.use_cuda:
             self.use_cuda = False
-
 
         if self.use_cuda:
             self.dtype = torch.cuda.FloatTensor
@@ -296,7 +295,6 @@ class VRAE(BaseEstimator, nn.Module):
         self.is_fitted = False
         self.dload = dload
         self.loss_type = loss
-        self.k1 = k1
         self.k2 = k2
 
         if self.use_cuda:
@@ -335,7 +333,7 @@ class VRAE(BaseEstimator, nn.Module):
         #print("T_mean_size:{0}, T_var_size:{1}".format(self.T_mean.size(), self.T_var.size()))
         return x_decoded, latent, scale
 
-    def _rec(self, x_decoded, x, loss_fn, scale):
+    def _rec(self, x_decoded, x, loss_fn, scale, k1, niter):
         """
         Compute the loss given output x decoded, input x and the specified loss function
 
@@ -354,9 +352,9 @@ class VRAE(BaseEstimator, nn.Module):
         elif self.loss_type == "LaplacianLoss":
             recon_loss = -loss_fn(x, x_decoded, scale)
 
-        return recon_loss + kl_loss + self.k2 * TK1_loss, recon_loss, kl_loss, TK1_loss
+        return recon_loss + k1[niter] * kl_loss + self.k2 * TK1_loss, recon_loss, k1[niter] * kl_loss, self.k2 * TK1_loss
 
-    def compute_loss(self, X):
+    def compute_loss(self, X, k1, niter):
         """
         Given input tensor, forward propagate, compute the loss, and backward propagate.
         Represents the lifecycle of a single iteration
@@ -367,7 +365,7 @@ class VRAE(BaseEstimator, nn.Module):
         x = Variable(X[:,:,:].type(self.dtype), requires_grad = True)
 
         x_decoded, _, scale = self(x)
-        loss, recon_loss, kl_loss, TK1_loss = self._rec(x_decoded, x.detach(), self.loss_fn, scale)
+        loss, recon_loss, kl_loss, TK1_loss = self._rec(x_decoded, x.detach(), self.loss_fn, scale, k1=k1, niter=niter)
 
         return loss, recon_loss, kl_loss, TK1_loss, x
 
@@ -380,6 +378,7 @@ class VRAE(BaseEstimator, nn.Module):
         :return:
         """
         self.train()
+        k1 = frange_cycle_linear(train_loader.__len__() * self.n_epochs)
 
         epoch_loss = 0
         t = 0
@@ -393,7 +392,7 @@ class VRAE(BaseEstimator, nn.Module):
             X = X.permute(1,0,2)
 
             self.optimizer.zero_grad()
-            loss, recon_loss, kl_loss, TK1_loss, _ = self.compute_loss(X)
+            loss, recon_loss, kl_loss, TK1_loss, _ = self.compute_loss(X, k1, self.total_epoch)
             loss.backward()
             if self.clip:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm = self.max_grad_norm)
@@ -404,7 +403,11 @@ class VRAE(BaseEstimator, nn.Module):
             self.optimizer.step()
 
             #visulization_train_process
-            visulization(vis, "line", X=self.total_epoch, Y=loss.item(), win_name="all")           
+            visulization(vis, "line", X=self.total_epoch, Y=loss.item(), win_name="all")
+            visulization(vis, "line", X=self.total_epoch, Y=recon_loss.item(), win_name="recon")  
+            visulization(vis, "line", X=self.total_epoch, Y=kl_loss.item(), win_name="k1") 
+            visulization(vis, "line", X=self.total_epoch, Y=TK1_loss.item(), win_name="Tk1") 
+
             if (t + 1) % self.print_every == 0:
                 print('Batch %d, loss = %.4f, recon_loss = %.4f, kl_loss = %.4f, TK1_loss = %.4f' % (t + 1, loss.item(),
                                                                                     recon_loss.item(), kl_loss.item(), TK1_loss.item()))
@@ -431,17 +434,6 @@ class VRAE(BaseEstimator, nn.Module):
             print('Epoch: %s' % i)
 
             self._train(train_loader, vis)
-            with torch.no_grad():
-                z_run = self.transform(val_dataset, for_visual=True)
-                z_run_pca = TruncatedSVD(n_components=3).fit_transform(z_run)
-            
-            visulization(
-                    vis, 
-                    "scatter", 
-                    X=z_run_pca, 
-                    Y=val_label + 1, 
-                    win_name="scatter"
-                    )
 
         self.is_fitted = True
         if save:
@@ -525,14 +517,15 @@ class VRAE(BaseEstimator, nn.Module):
         :return:
         """
         self.eval()
-
         test_loader = DataLoader(dataset = dataset,
                                  batch_size = self.batch_size,
                                  shuffle = False,
-                                 drop_last=True) # Don't shuffle for test_loader
+                                 drop_last = True) # Don't shuffle for test_loader
+
         if (self.is_fitted) or (for_visual):
             with torch.no_grad():
                 z_run = []
+                T_mean = []
 
                 for t, x in enumerate(test_loader):
                     x = x[0]
@@ -540,15 +533,17 @@ class VRAE(BaseEstimator, nn.Module):
 
                     z_run_each = self._batch_transform(x)
                     z_run.append(z_run_each)
+                    T_mean.append(self.T_mean.cpu().detach().numpy())
 
                 z_run = np.concatenate(z_run, axis=0)
+                T_mean = np.concatenate(T_mean, axis=0)
                 if save:
                     if os.path.exists(self.dload):
                         pass
                     else:
                         os.mkdir(self.dload)
                     z_run.dump(self.dload + '/z_run.pkl')
-                return z_run
+                return z_run, T_mean
 
         raise RuntimeError('Model needs to be fit')
 
