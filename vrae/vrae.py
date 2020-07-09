@@ -48,7 +48,6 @@ class Encoder(nn.Module):
         """
 
         enc_out, (h_end, c_end) = self.model(x)
-        #print("encoderデータサイズ",enc_out.size())
         return torch.sum(h_end, dim=0), enc_out
 
 
@@ -90,28 +89,27 @@ class Lambda(nn.Module):
 
 class selfAttention(torch.nn.Module):
 
-  def __init__(self, method="dot"):
-    super(selfAttention, self).__init__()
-    self.method = method
-    #self.hidden_size = hidden_size
+    def __init__(self, method="dot"):
+        super(selfAttention, self).__init__()
+        self.method = method
 
-  def forward(self, encoder_outputs):
-    #encoder_outputs [batch_size, seq_len, hidden_dim]
-    #decoder_hidden [batch_size, hidden_dim, seq_len]
-    #return context [batch_size, seq_len, hidden_dim]
+    def forward(self, encoder_outputs):
+        #encoder_outputs [batch_size, seq_len, hidden_dim]
+        #decoder_hidden [batch_size, hidden_dim, seq_len]
+        #return context [batch_size, seq_len, hidden_dim]
 
-    if self.method == "dot":
-      # For the dot scoring method, no weights or linear layers are involved
-      scale_size = encoder_outputs.size(2)
-      sim_matrix = encoder_outputs.permute(1, 0, 2).bmm(encoder_outputs.permute(1, 2, 0))
-      sim_matrix = sim_matrix / np.sqrt(scale_size)
-      sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=2)
+        if self.method == "dot":
+            # For the dot scoring method, no weights or linear layers are involved
+            scale_size = encoder_outputs.size(2)
+            sim_matrix = encoder_outputs.permute(1, 0, 2).bmm(encoder_outputs.permute(1, 2, 0))
+            sim_matrix = sim_matrix / np.sqrt(scale_size)
+            sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=2)
       
-      def context_fun(encoder_outputs, sim_matrix, index):
-          context_vec = encoder_outputs.permute(1, 0, 2) * sim_matrix[:, index, :].unsqueeze(2)
-          return context_vec.sum(dim=1).unsqueeze(1)
+        def context_fun(encoder_outputs, sim_matrix, index):
+            context_vec = encoder_outputs.permute(1, 0, 2) * sim_matrix[:, index, :].unsqueeze(2)
+            return context_vec.sum(dim=1).unsqueeze(1)
       
-      return torch.cat([context_fun(encoder_outputs, sim_matrix, i) \
+        return torch.cat([context_fun(encoder_outputs, sim_matrix, i) \
                     for i in range(sim_matrix.size(2))], dim=1)
 
 class Decoder(nn.Module):
@@ -363,7 +361,11 @@ class VRAE(BaseEstimator, nn.Module):
         :return: total loss, reconstruction loss, kl-divergence loss and original input
         """
         x = Variable(X[:,:,:].type(self.dtype), requires_grad = True)
-
+        
+        if torch.cuda.device_count() > 1:
+            print("start multiGPU")
+            self = torch.nn.DataParallel(self)
+        
         x_decoded, _, scale = self(x)
         loss, recon_loss, kl_loss, TK1_loss = self._rec(x_decoded, x.detach(), self.loss_fn, scale, k1=k1, niter=niter)
 
@@ -415,7 +417,7 @@ class VRAE(BaseEstimator, nn.Module):
         print('Average loss: {:.4f}'.format(epoch_loss / t))
 
 
-    def fit(self, train_dataset, val_dataset, val_label, env = "vrae", save = False):
+    def fit(self, train_dataset, env="vae", save = False):
         """
         Calls `_train` function over a fixed number of epochs, specified by `n_epochs`
 
